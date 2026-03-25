@@ -40,9 +40,7 @@ def detect_impulse(
     directional_move = df["close"] - df["close"].shift(burst_window)
     momentum = directional_move / df["close"].shift(burst_window)
 
-    df["impulse_strength"] = (
-        momentum.abs() / (df["atr_pct"] * np.sqrt(burst_window) + 1e-12)
-    )
+    df["impulse_strength"] = momentum.abs() / (df["atr_pct"] * np.sqrt(burst_window) + 1e-12)
 
     df["impulse"] = (df["impulse_strength"] > atr_multiplier).astype(int)
     df["impulse_dir"] = np.sign(momentum).fillna(0)

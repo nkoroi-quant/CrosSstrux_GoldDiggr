@@ -1,4 +1,3 @@
-
 """
 Decision engine for CrossStrux v3.
 
@@ -109,11 +108,24 @@ def decide_trade(
         session_bonus = 0.03
 
     persistence_bonus = -0.04 if persistence_score >= 0.70 else 0.0
-    signal_history_score = _signal_history_score(signal_history, "BUY") if context.get("active_bias") == "BULLISH" else _signal_history_score(signal_history, "SELL")
+    signal_history_score = (
+        _signal_history_score(signal_history, "BUY")
+        if context.get("active_bias") == "BULLISH"
+        else _signal_history_score(signal_history, "SELL")
+    )
     history_bonus = -0.02 if signal_history_score >= 0.67 else 0.0
 
     dynamic_threshold = _clamp(
-        base_threshold + volatility_adj + spread_pressure + streak_pressure + drawdown_pressure + transition_pressure + cdi_pressure + session_bonus + history_bonus + persistence_bonus,
+        base_threshold
+        + volatility_adj
+        + spread_pressure
+        + streak_pressure
+        + drawdown_pressure
+        + transition_pressure
+        + cdi_pressure
+        + session_bonus
+        + history_bonus
+        + persistence_bonus,
         0.55,
         0.90,
     )
@@ -174,11 +186,19 @@ def decide_trade(
     if not long_signal and not short_signal:
         active_bias = str(context.get("active_bias", "NEUTRAL")).upper()
         signal_confidence = _as_float(context.get("signal_confidence"), probability)
-        if active_bias == "BULLISH" and signal_confidence >= dynamic_threshold and market_state in {"TRENDING", "BREAKOUT"}:
+        if (
+            active_bias == "BULLISH"
+            and signal_confidence >= dynamic_threshold
+            and market_state in {"TRENDING", "BREAKOUT"}
+        ):
             long_signal = True
             setup = "bias_fallback_long"
             reason = "Strong bullish bias fallback with supportive market state."
-        elif active_bias == "BEARISH" and signal_confidence >= dynamic_threshold and market_state in {"TRENDING", "BREAKOUT"}:
+        elif (
+            active_bias == "BEARISH"
+            and signal_confidence >= dynamic_threshold
+            and market_state in {"TRENDING", "BREAKOUT"}
+        ):
             short_signal = True
             setup = "bias_fallback_short"
             reason = "Strong bearish bias fallback with supportive market state."
@@ -204,7 +224,9 @@ def decide_trade(
     if bars_since_last_trade > 3:
         structure_bonus += 0.01
 
-    signal_confidence = _clamp(probability + structure_bonus - (transition * 0.10) - (cdi * 0.05), 0.0, 0.99)
+    signal_confidence = _clamp(
+        probability + structure_bonus - (transition * 0.10) - (cdi * 0.05), 0.0, 0.99
+    )
 
     # Conservative regime-aware cooldown guidance.
     if regime == "low":
@@ -223,7 +245,9 @@ def decide_trade(
     # Base risk recommendation derived from regime and model quality.
     base_risk_pct = {"low": 0.35, "mid": 0.50, "high": 0.70}.get(regime, 0.50)
     signal_risk_adjustment = 0.15 * (signal_confidence - dynamic_threshold)
-    recommended_risk_pct = _clamp(base_risk_pct * risk_multiplier + signal_risk_adjustment, 0.05, 1.25)
+    recommended_risk_pct = _clamp(
+        base_risk_pct * risk_multiplier + signal_risk_adjustment, 0.05, 1.25
+    )
 
     return {
         "action": action,
@@ -249,4 +273,3 @@ def decide_trade(
             "min_persistence": min_persistence,
         },
     }
-

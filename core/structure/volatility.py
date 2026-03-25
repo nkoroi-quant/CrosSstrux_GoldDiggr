@@ -7,7 +7,9 @@ from __future__ import annotations
 import pandas as pd
 
 
-def volatility_expansion(df: pd.DataFrame, short_window: int = 5, mid_window: int = 50) -> pd.DataFrame:
+def volatility_expansion(
+    df: pd.DataFrame, short_window: int = 5, mid_window: int = 50
+) -> pd.DataFrame:
     """
     Detect volatility expansion relative to a longer baseline.
     """
@@ -20,5 +22,7 @@ def volatility_expansion(df: pd.DataFrame, short_window: int = 5, mid_window: in
     df["volatility_expansion"] = df["vol_short_std"] / (df["vol_mid_std"] + 1e-12)
     df["volatility_expansion"] = df["volatility_expansion"].rolling(3, min_periods=1).mean()
 
-    df["volatility_expansion"] = df["volatility_expansion"].replace([pd.NA, float("inf"), float("-inf")], 0).fillna(0)
+    df["volatility_expansion"] = (
+        df["volatility_expansion"].replace([pd.NA, float("inf"), float("-inf")], 0).fillna(0)
+    )
     return df

@@ -1,4 +1,3 @@
-
 """
 Response formatting for CrossStrux v3.
 
@@ -174,4 +173,3 @@ def build_response(
         "v3": v3,
     }
     return response
-

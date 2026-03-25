@@ -45,7 +45,11 @@ def build_payload(asset: str, df: pd.DataFrame) -> Dict:
             "high": float(row["high"]),
             "low": float(row["low"]),
             "close": float(row["close"]),
-            "volume": float(row["tick_volume"]) if "tick_volume" in df.columns else float(row.get("volume", 0)),
+            "volume": (
+                float(row["tick_volume"])
+                if "tick_volume" in df.columns
+                else float(row.get("volume", 0))
+            ),
             "spread": float(row["spread"]) if "spread" in df.columns else 0.0,
         }
         candles.append(candle)
@@ -53,7 +57,9 @@ def build_payload(asset: str, df: pd.DataFrame) -> Dict:
     return {
         "asset": asset,
         "timeframe": "M1",
-        "spread_points": float(df["spread"].iloc[-1]) if "spread" in df.columns and len(df) else 0.0,
+        "spread_points": (
+            float(df["spread"].iloc[-1]) if "spread" in df.columns and len(df) else 0.0
+        ),
         "bid": float(df["close"].iloc[-1]) if len(df) else None,
         "ask": float(df["close"].iloc[-1]) if len(df) else None,
         "candles": candles,

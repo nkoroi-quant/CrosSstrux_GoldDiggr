@@ -42,14 +42,10 @@ def detect_key_levels(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
 
     # Order block proxy: a strong candle closing in direction of impulse near a level.
     df["bullish_order_block"] = (
-        (df["impulse_dir"] > 0) &
-        (df["close"] > df["open"]) &
-        (df["close"] >= df["midpoint"])
+        (df["impulse_dir"] > 0) & (df["close"] > df["open"]) & (df["close"] >= df["midpoint"])
     ).astype(int)
     df["bearish_order_block"] = (
-        (df["impulse_dir"] < 0) &
-        (df["close"] < df["open"]) &
-        (df["close"] <= df["midpoint"])
+        (df["impulse_dir"] < 0) & (df["close"] < df["open"]) & (df["close"] <= df["midpoint"])
     ).astype(int)
 
     return df

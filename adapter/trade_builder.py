@@ -1,4 +1,3 @@
-
 """
 Trade construction for CrossStrux v3.
 
@@ -127,11 +126,17 @@ def build_trade(
         "volatility_state": volatility_state,
         "liquidity_state": liquidity_state,
         "session": session,
-        "dynamic_threshold": float(signal.get("dynamic_threshold", context.get("dynamic_threshold", 0.65))),
-        "persistence_score": float(signal.get("persistence_score", context.get("persistence_score", 0.0))),
+        "dynamic_threshold": float(
+            signal.get("dynamic_threshold", context.get("dynamic_threshold", 0.65))
+        ),
+        "persistence_score": float(
+            signal.get("persistence_score", context.get("persistence_score", 0.0))
+        ),
         "trend_score": float(signal.get("trend_score", context.get("trend_score", 0.0))),
         "cooldown_bars": int(signal.get("cooldown_bars", context.get("cooldown_bars", 2))),
-        "recommended_risk_pct": round(float(signal.get("recommended_risk_pct", context.get("recommended_risk_pct", 0.50))), 3),
+        "recommended_risk_pct": round(
+            float(signal.get("recommended_risk_pct", context.get("recommended_risk_pct", 0.50))), 3
+        ),
         "lot_multiplier": round(float(context.get("risk_multiplier", 1.0)), 3),
         "partial_tp": partial_tp,
         "breakeven_at_rr": breakeven_rr,
@@ -144,6 +149,7 @@ def build_trade(
             "midpoint": round(midpoint, precision),
         },
         "risk_multiplier": float(context.get("risk_multiplier", 1.0)),
-        "signal_strength": round(float(signal.get("probability", context.get("probability", 0.0))), 3),
+        "signal_strength": round(
+            float(signal.get("probability", context.get("probability", 0.0))), 3
+        ),
     }
-

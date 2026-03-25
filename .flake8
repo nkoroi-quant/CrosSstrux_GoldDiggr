@@ -1,0 +1,15 @@
+[flake8]
+max-line-length = 127
+max-complexity = 12
+extend-ignore = E203, E501, W503, F401, F841, E402, C901
+per-file-ignores =
+    adapter/decision_engine.py:C901
+    training/train.py:C901
+    bootstrap_real_data.py:C901
+    inference/engine.py:E203,F841
+    tools/backtest_harness.py:E203
+    tests/*:E402,F401
+    run_training_pipeline.py:E402,F401
+    dashboard/drift_monitor.py:F401
+    config/settings.py:F401
+    data_layer/collector.py:F401

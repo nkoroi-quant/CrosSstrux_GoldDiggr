@@ -3,6 +3,7 @@
 import httpx
 from typing import List, Dict
 
+
 class GoldDiggrClient:
     def __init__(self, base_url: str = "http://localhost:8000", api_key: str | None = None):
         self.client = httpx.AsyncClient(timeout=10.0)

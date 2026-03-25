@@ -39,16 +39,18 @@ def main():
         tz="UTC",
     )
 
-    df = pd.DataFrame({
-        "time": times,
-        "open": open_,
-        "high": high,
-        "low": low,
-        "close": close,
-        "tick_volume": volume,
-        "spread": spread,
-        "real_volume": volume,
-    })
+    df = pd.DataFrame(
+        {
+            "time": times,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "tick_volume": volume,
+            "spread": spread,
+            "real_volume": volume,
+        }
+    )
     df.to_parquet(OUTPUT, index=False)
     print(f"Saved synthetic XAUUSD data to {OUTPUT}")
 
