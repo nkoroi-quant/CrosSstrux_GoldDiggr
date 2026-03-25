@@ -1,0 +1,49 @@
+{
+  "asset_name": "XAUUSD",
+  "low_threshold": 528.8806373303161,
+  "high_threshold": 1725.965605162622,
+  "feature_columns": [
+    "impulse_norm",
+    "impulse_norm_lag1",
+    "impulse_norm_lag3",
+    "impulse_norm_lag5",
+    "impulse_norm_lag10",
+    "balance_lag1",
+    "balance_lag3",
+    "balance_lag5",
+    "balance_lag10",
+    "volatility_expansion_lag1",
+    "volatility_expansion_lag3",
+    "volatility_expansion_lag5",
+    "volatility_expansion_lag10",
+    "impulse_momentum_5",
+    "balance_momentum_5",
+    "volatility_momentum_5",
+    "impulse_acceleration_5"
+  ],
+  "transition_features": [
+    "impulse_norm",
+    "impulse_norm_lag1",
+    "impulse_norm_lag3",
+    "impulse_norm_lag5",
+    "impulse_norm_lag10",
+    "balance_lag1",
+    "balance_lag3",
+    "balance_lag5",
+    "balance_lag10",
+    "volatility_expansion_lag1",
+    "volatility_expansion_lag3",
+    "volatility_expansion_lag5",
+    "volatility_expansion_lag10",
+    "impulse_momentum_5",
+    "balance_momentum_5",
+    "volatility_momentum_5",
+    "impulse_acceleration_5",
+    "regime_encoded"
+  ],
+  "trained_regimes": [
+    "low",
+    "mid",
+    "high"
+  ]
+}

@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  server:
+    build: .
+    image: crossstrux-v2:latest
+    container_name: crossstrux-v2
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./config:/app/config
+      - ./data:/app/data
+    environment:
+      - MODEL_ROOT=/app/models
+      - DATA_DIR=/app/data/raw
+    restart: unless-stopped

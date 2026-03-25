@@ -1,0 +1,52 @@
+{
+  "api_keys": {
+    "test-key-001": {
+      "tier": "free",
+      "rate_limit": 10,
+      "rate_window": 60,
+      "allowed_assets": ["XAUUSD"],
+      "created_at": "2026-03-01T00:00:00Z",
+      "expires_at": null,
+      "enabled": true
+    },
+    "prod-key-001": {
+      "tier": "basic",
+      "rate_limit": 60,
+      "rate_window": 60,
+      "allowed_assets": ["*"],
+      "created_at": "2026-03-01T00:00:00Z",
+      "expires_at": null,
+      "enabled": true
+    }
+  },
+  "tiers": {
+    "free": {
+      "name": "Free",
+      "description": "Limited access for testing",
+      "max_requests_per_minute": 10,
+      "max_assets": 1,
+      "features": ["basic_prediction"]
+    },
+    "basic": {
+      "name": "Basic",
+      "description": "For individual traders",
+      "max_requests_per_minute": 60,
+      "max_assets": 10,
+      "features": ["basic_prediction", "drift_monitoring"]
+    },
+    "professional": {
+      "name": "Professional",
+      "description": "For professional traders",
+      "max_requests_per_minute": 300,
+      "max_assets": 50,
+      "features": ["basic_prediction", "drift_monitoring", "advanced_analytics", "api_access"]
+    },
+    "enterprise": {
+      "name": "Enterprise",
+      "description": "For institutions",
+      "max_requests_per_minute": 1000,
+      "max_assets": -1,
+      "features": ["all_features", "dedicated_support", "sla", "custom_models"]
+    }
+  }
+}

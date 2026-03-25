@@ -1,0 +1,29 @@
+{
+  "asset": "XAUUSD",
+  "timeframe": "M1",
+  "spread_points": 35,
+  "bid": 2346.21,
+  "ask": 2346.56,
+  "candles": [
+    {"timestamp":"2026-03-11 10:00","open":2342.10,"high":2342.88,"low":2341.90,"close":2342.55,"volume":1000,"spread":35},
+    {"timestamp":"2026-03-11 10:01","open":2342.55,"high":2343.20,"low":2342.42,"close":2342.98,"volume":1200,"spread":34},
+    {"timestamp":"2026-03-11 10:02","open":2342.98,"high":2343.50,"low":2342.70,"close":2343.10,"volume":1100,"spread":32},
+    {"timestamp":"2026-03-11 10:03","open":2343.10,"high":2344.02,"low":2342.95,"close":2343.88,"volume":1300,"spread":31},
+    {"timestamp":"2026-03-11 10:04","open":2343.88,"high":2344.45,"low":2343.70,"close":2344.25,"volume":1400,"spread":30},
+    {"timestamp":"2026-03-11 10:05","open":2344.25,"high":2345.10,"low":2344.00,"close":2344.92,"volume":1500,"spread":30},
+    {"timestamp":"2026-03-11 10:06","open":2344.92,"high":2345.60,"low":2344.60,"close":2345.45,"volume":1600,"spread":29},
+    {"timestamp":"2026-03-11 10:07","open":2345.45,"high":2346.20,"low":2345.10,"close":2345.98,"volume":1700,"spread":28},
+    {"timestamp":"2026-03-11 10:08","open":2345.98,"high":2346.75,"low":2345.70,"close":2346.30,"volume":1800,"spread":28},
+    {"timestamp":"2026-03-11 10:09","open":2346.30,"high":2347.10,"low":2346.00,"close":2346.82,"volume":1900,"spread":27},
+    {"timestamp":"2026-03-11 10:10","open":2346.82,"high":2347.45,"low":2346.60,"close":2347.20,"volume":1850,"spread":27},
+    {"timestamp":"2026-03-11 10:11","open":2347.20,"high":2348.10,"low":2347.05,"close":2347.92,"volume":1800,"spread":26},
+    {"timestamp":"2026-03-11 10:12","open":2347.92,"high":2348.40,"low":2347.70,"close":2348.10,"volume":1750,"spread":26},
+    {"timestamp":"2026-03-11 10:13","open":2348.10,"high":2348.95,"low":2347.95,"close":2348.60,"volume":1700,"spread":25},
+    {"timestamp":"2026-03-11 10:14","open":2348.60,"high":2349.10,"low":2348.20,"close":2348.88,"volume":1650,"spread":25},
+    {"timestamp":"2026-03-11 10:15","open":2348.88,"high":2349.45,"low":2348.60,"close":2349.20,"volume":1600,"spread":24},
+    {"timestamp":"2026-03-11 10:16","open":2349.20,"high":2349.95,"low":2349.00,"close":2349.70,"volume":1550,"spread":24},
+    {"timestamp":"2026-03-11 10:17","open":2349.70,"high":2350.20,"low":2349.50,"close":2349.98,"volume":1500,"spread":24},
+    {"timestamp":"2026-03-11 10:18","open":2349.98,"high":2350.60,"low":2349.85,"close":2350.30,"volume":1450,"spread":23},
+    {"timestamp":"2026-03-11 10:19","open":2350.30,"high":2350.95,"low":2350.10,"close":2350.72,"volume":1400,"spread":23}
+  ]
+}
