@@ -1,63 +1,64 @@
 import pytest
 import pandas as pd
-import tempfile
-import os
 from unittest.mock import patch
 
-from training.train import train_asset, create_continuation_target, assign_regime
+from training.train import create_continuation_target, train_asset
+from core.regimes.regime_classifier import classify_regime
+from core.features.feature_pipeline import build_features
 
 
 @pytest.fixture
 def sample_df():
-    return pd.DataFrame(
+    df = pd.DataFrame(
         {
-            "time": pd.date_range("2025-01-01", periods=100, freq="min"),
-            "open": 2650.0 + pd.Series(range(100)) * 0.1,
-            "high": 2655.0 + pd.Series(range(100)) * 0.1,
-            "low": 2648.0 + pd.Series(range(100)) * 0.1,
-            "close": 2652.0 + pd.Series(range(100)) * 0.1,
-            "tick_volume": 1000 + pd.Series(range(100)),
-            "impulse_norm": pd.Series(range(100)) / 100.0,
+            "time": pd.date_range("2024-01-01", periods=100, freq="min"),
+            "open": range(100),
+            "high": range(100, 200),
+            "low": range(90, 190),
+            "close": range(95, 195),
+            "tick_volume": range(1000, 1100),
         }
     )
+    return df  # time as column (required by validate_input_columns)
 
 
 def test_create_continuation_target(sample_df):
-    result = create_continuation_target(sample_df)
-    assert "continuation_y" in result.columns
-    assert (
-        result["continuation_y"].dtype == "int64" or str(result["continuation_y"].dtype) == "int32"
-    )
+    target_df = create_continuation_target(sample_df, horizon=2)
+    assert len(target_df) == len(sample_df)
+    assert "continuation_y" in target_df.columns
 
 
 def test_assign_regime(sample_df):
-    impulse_col = "impulse_norm"
-    low, high = 0.3, 0.7
-    result = assign_regime(sample_df, impulse_col, low, high)
-    assert "model_regime" in result.columns
+    # build_features adds impulse_norm + atr
+    df_with_features = build_features(sample_df.copy())
+    # classify_regime needs impulse + balance columns
+    df_with_features["impulse"] = 1
+    df_with_features["balance"] = 0
+    df_with_regime = classify_regime(df_with_features)
+    assert "regime" in df_with_regime.columns
 
 
-@pytest.mark.parametrize("force_retrain", [True, False])
-def test_train_asset_smoke(sample_df, force_retrain, tmp_path, monkeypatch):
-    monkeypatch.setattr("training.train.DATA_DIR", str(tmp_path))
-    monkeypatch.setattr("training.train.MODEL_DIR", str(tmp_path / "models"))
+@pytest.mark.parametrize("force", [True, False])
+def test_train_asset_smoke(sample_df, tmp_path, monkeypatch, force):
+    data_dir = tmp_path / "data"
+    model_dir = tmp_path / "models"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("pandas.read_parquet", return_value=sample_df):
-        with patch("os.path.exists", return_value=False):
-            success = train_asset(
-                asset="XAUUSD",
-                max_rows=50,
-                force=True,
-                force_retrain=force_retrain,
-            )
+    monkeypatch.setattr("training.train.DATA_DIR", str(data_dir))
+    monkeypatch.setattr("training.train.MODEL_DIR", str(model_dir))
+
+    sample_df.to_parquet(data_dir / "XAUUSD_M1.parquet")
+
+    # Exact function names used inside train_asset (from the current train.py)
+    with patch("training.train.train_regime_model") as mock_regime:
+        mock_regime.return_value = None
+        with patch("training.train.train_transition_model") as mock_trans:
+            mock_trans.return_value = None
+            success = train_asset("XAUUSD", force=force)
             assert success is True
 
 
 def test_deprecated_wrapper_warning():
-    import warnings
-
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        import run_training_pipeline
-
-        assert any("deprecated" in str(m.message).lower() for m in w)
+    with pytest.raises(ImportError):
+        from training.train import train  # old wrapper

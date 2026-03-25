@@ -1,10 +1,10 @@
 import pytest
 import pandas as pd
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import json
 from pathlib import Path
 
-# Import actual functions from your collector (no Collector class assumed)
+# Import the actual functions (no DataCollector class anymore)
 from data_layer.collector import (
     load_symbol_map,
     initialize_mt5,
@@ -17,7 +17,8 @@ from data_layer.collector import (
 
 @pytest.fixture
 def mock_mt5():
-    with patch("MetaTrader5") as mock:
+    """Correct patch target — this is the alias used inside collector.py"""
+    with patch("data_layer.collector.mt5") as mock:
         mock.initialize.return_value = True
         mock.symbol_select.return_value = True
         mock.copy_rates_from_pos.return_value = [
@@ -44,19 +45,19 @@ def test_load_existing_config(tmp_path):
 def test_load_missing_config_returns_defaults():
     result = load_symbol_map(None)  # or missing path
     assert "XAUUSD" in result
-    # Your defaults may not include BTCUSD - this test is relaxed
     assert isinstance(result, dict)
 
 
 def test_initialize_success(mock_mt5):
     result = initialize_mt5()
     assert result is True
+    mock_mt5.initialize.assert_called_once()
 
 
-def test_initialize_failure():
-    with patch("MetaTrader5.initialize", return_value=False):
-        with pytest.raises(RuntimeError, match="MT5 initialization failed"):
-            initialize_mt5()
+def test_initialize_failure(mock_mt5):
+    mock_mt5.initialize.return_value = False
+    with pytest.raises(RuntimeError, match="MT5 initialization failed"):
+        initialize_mt5()
 
 
 def test_fetch_success(mock_mt5):
@@ -81,18 +82,20 @@ def test_update_parquet_new_file_creation(mock_mt5, tmp_path):
     with patch("data_layer.collector.DATA_DIR", str(tmp_path)):
         result = update_parquet("XAUUSD", "GOLD")
         assert result is True
+        assert (tmp_path / "GOLD_M1.parquet").exists()
 
 
-def test_update_parquet_symbol_not_available():
-    with patch("MetaTrader5.symbol_select", return_value=False):
-        with pytest.raises(RuntimeError, match="Failed to select symbol"):
-            update_parquet("INVALID", "INVALID")
+def test_update_parquet_symbol_not_available(mock_mt5):
+    mock_mt5.symbol_select.return_value = False
+    with pytest.raises(RuntimeError, match="Failed to select symbol"):
+        update_parquet("INVALID", "INVALID")
 
 
-def test_collect_assets(mock_mt5):
-    results = collect_assets(["XAUUSD"])
-    assert isinstance(results, dict)
-    assert "XAUUSD" in results
+def test_collect_assets(mock_mt5, tmp_path):
+    with patch("data_layer.collector.DATA_DIR", str(tmp_path)):
+        results = collect_assets(["XAUUSD"])
+        assert isinstance(results, dict)
+        assert "XAUUSD" in results
 
 
 def test_deduplication_on_time():
