@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest tests/ --cov=inference --cov=core --cov=adapter --cov=training --cov-report=xml --cov-fail-under=85
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
