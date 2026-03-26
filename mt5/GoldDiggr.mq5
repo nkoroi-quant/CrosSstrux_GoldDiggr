@@ -1,10 +1,11 @@
 //+------------------------------------------------------------------+
-//|               GoldDiggr_Integrated_v10.2.mq5                     |
-//|  Full rich context engine with flattened stability improvements |
+//|           GoldDiggr_Integrated_v10.4.mq5                         |
+//|   CrosSstrux-aware entry tuning + adaptive thresholds            |
+//|   + pyramiding + profit shaping + dynamic sizing                 |
 //+------------------------------------------------------------------+
 #property copyright "nkoroi-quant + integration"
 #property link      "https://github.com/nkoroi-quant/CrosSstrux_GoldDiggr"
-#property version   "10.2"
+#property version   "10.4"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -13,11 +14,15 @@ CTrade trade;
 
 // ========================= INPUTS =========================
 input string API_URL               = "http://127.0.0.1:8000/analyze";
-input string API_KEY               = "";                    // Optional
+input string API_KEY               = "";
 input string AssetName             = "XAUUSD";
 input long   MagicNumber           = 260325;
 
 input double BaseLot               = 0.01;
+input double RiskPercentPerTrade   = 0.75;   // % equity risk per trade before dynamic multipliers
+input double MaxRiskPercentPerTrade= 2.00;   // hard cap for safety
+input double MaxLotCap             = 0.20;   // hard cap on absolute lots; 0 = broker max only
+
 input int    ATR_Period            = 14;
 input double ATR_Multiplier        = 2.0;
 
@@ -25,7 +30,7 @@ input double MinProbability        = 58.0;
 input double StrongProb            = 65.0;
 input double MaxCDI                = 0.60;
 
-input bool   AllowOffHours         = true;
+input bool   AllowOffHours         = false;
 input int    SignalConfirmations   = 2;
 input int    MaxPositions          = 3;
 input int    MinBarsBetweenEntries = 2;
@@ -63,13 +68,14 @@ int      g_candleCount = 0;
 datetime lastCandleTime      = 0;
 datetime lastEntryCandleTime = 0;
 
-string signalBuffer[5];
-int    signalCount = 0;
+string   recentSignals[5];
+int      recentSignalCount = 0;
 
-string recentSignals[5];
-int    recentSignalCount = 0;
+ulong    partialClosedTickets[128];
 
-ulong  partialClosedTickets[128];
+// Confirmation state
+string   confirmSignalName = "";
+int      confirmSignalCount = 0;
 
 // Equity tracking
 double equityHistory[EQUITY_HISTORY_SIZE];
@@ -99,7 +105,6 @@ int    consecutiveWins        = 0;
 int    consecutiveLosses      = 0;
 
 int atrHandle = INVALID_HANDLE;
-
 string PanelPrefix = "GoldDiggr_";
 
 // ========================= STRUCT =========================
@@ -118,6 +123,7 @@ struct SignalData
    double momentum_points;
    double avg_range_points;
    double context_score;
+   double adaptive_threshold;
 };
 
 // ========================= LOG =========================
@@ -128,6 +134,7 @@ int OnInit()
 {
    trade.SetExpertMagicNumber((int)MagicNumber);
    trade.SetDeviationInPoints(20);
+   trade.SetTypeFillingBySymbol(_Symbol);
 
    ArraySetAsSeries(g_candles, true);
 
@@ -156,7 +163,7 @@ int OnInit()
    EventSetTimer(1);
    if(UsePanel) CreatePanel();
 
-   Log("GoldDiggr v10.2 Integrated initialized successfully");
+   Log("GoldDiggr v10.4 Integrated initialized successfully");
    return INIT_SUCCEEDED;
 }
 
@@ -164,12 +171,12 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
-   if(UsePanel) ObjectsDeleteAll(0, PanelPrefix);
+   if(UsePanel) ObjectsDeleteAll(0, -1, -1, PanelPrefix);
 }
 
 // ========================= PANEL =========================
 void CreatePanel() { Log("Panel enabled (basic)"); }
-void UpdatePanel(string regime, double prob, bool elevated) { /* expand later if needed */ }
+void UpdatePanel(string regime, double prob, bool elevated) { /* optional */ }
 
 // ========================= HELPERS =========================
 double ClampDouble(double v, double lo, double hi)
@@ -189,6 +196,8 @@ bool RefreshCandleBuffer()
 {
    ArraySetAsSeries(g_candles, true);
    g_candleCount = CopyRates(_Symbol, PERIOD_M1, 1, MAX_CANDLES, g_candles);
+   if(g_candleCount >= 1)
+      lastCandleTime = g_candles[0].time;
    return (g_candleCount >= 20);
 }
 
@@ -226,14 +235,37 @@ double GetEquityCurveFactor()
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    if(eq <= 0.0) return 1.0;
    if(eq > equityPeak) equityPeak = eq;
+
    double dd = (equityPeak - eq) / equityPeak;
    double slope = GetEquityCurveSlope();
    double factor = 1.0;
+
    if(dd > EquityHardDDLimit || slope < -0.03) factor = 0.40;
    else if(dd > 0.08 || slope < -0.02) factor = 0.60;
    else if(dd > EquitySoftDDLimit || slope < -0.01) factor = 0.80;
    else if(dd < 0.01 && slope > 0.01) factor = 1.10;
+
    return ClampDouble(factor, 0.40, 1.10);
+}
+
+double GetVolatilityFactor(double atrPoints, double avgRangePoints)
+{
+   if(atrPoints <= 0.0) return 1.0;
+   if(avgRangePoints <= 0.0) avgRangePoints = atrPoints;
+
+   double ratio = atrPoints / avgRangePoints;
+   double factor = 1.0;
+
+   if(ratio < 0.70) factor = 0.90;
+   else if(ratio < 0.95) factor = 1.05;
+   else if(ratio < 1.25) factor = 1.15;
+   else if(ratio < 1.60) factor = 0.95;
+   else factor = 0.80;
+
+   if(atrPoints < 60.0) factor *= 0.85;
+   else if(atrPoints > 250.0) factor *= 0.80;
+
+   return ClampDouble(factor, 0.60, 1.25);
 }
 
 int CountOurPositions()
@@ -255,8 +287,8 @@ bool HasOpenPositionType(ENUM_POSITION_TYPE ptype)
    {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket))
-         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
-            PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
             (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == ptype)
             return true;
    }
@@ -269,8 +301,8 @@ bool HasOppositePosition(ENUM_POSITION_TYPE ptype)
    {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket))
-         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
-            PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
             (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != ptype)
             return true;
    }
@@ -301,8 +333,8 @@ double BasketProfit(ENUM_POSITION_TYPE ptype)
    {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket))
-         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
-            PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
             (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == ptype)
             sum += PositionGetDouble(POSITION_PROFIT);
    }
@@ -315,6 +347,7 @@ string BuildSignalHistoryJson()
    int count = MathMin(recentSignalCount, size);
    string json = "[";
    bool first = true;
+
    for(int i = 0; i < count; i++)
    {
       int idx = (recentSignalCount - count + i) % size;
@@ -325,6 +358,7 @@ string BuildSignalHistoryJson()
          first = false;
       }
    }
+
    json += "]";
    return json;
 }
@@ -338,7 +372,7 @@ void PushRecentSignal(string s)
 
 int BarsSinceLastEntry()
 {
-   if(lastEntryCandleTime == 0) return 999;
+   if(lastEntryCandleTime == 0 || lastCandleTime == 0) return 999;
    int secs = (int)(lastCandleTime - lastEntryCandleTime);
    return (secs > 0) ? secs / 60 : 0;
 }
@@ -348,11 +382,20 @@ double NormalizeVolumeToStep(double volume)
    double minVol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    double maxVol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   if(MaxLotCap > 0.0)
+      maxVol = MathMin(maxVol, MaxLotCap);
+
    if(step <= 0.0) step = 0.01;
+   if(volume <= 0.0) return 0.0;
+
    volume = MathFloor(volume / step) * step;
-   volume = MathMax(volume, 0.0);
-   volume = MathMin(volume, maxVol);
-   return (volume < minVol) ? 0.0 : NormalizeDouble(volume, 2);
+   volume = NormalizeDouble(volume, 2);
+
+   if(volume > maxVol) volume = maxVol;
+   if(volume < minVol) return 0.0;
+
+   return volume;
 }
 
 double AdjustRiskByEquity(double lot)
@@ -360,35 +403,16 @@ double AdjustRiskByEquity(double lot)
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
    if(balance <= 0.0) return lot;
+
    double dd = (balance - equity) / balance;
+
    if(dd > EquityHardDDLimit) lot *= 0.40;
    else if(dd > EquitySoftDDLimit) lot *= 0.75;
    else if(dd > 0.02) lot *= 0.90;
    else if(dd < 0.01) lot *= 1.05;
+
    lot *= GetEquityCurveFactor();
    return lot;
-}
-
-bool StopDistancesValid(ENUM_POSITION_TYPE type, double sl, double tp)
-{
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double pt  = SymbolPoint();
-   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   int minLevelPts = stopsLevel + 2;
-   double minDist = minLevelPts * pt;
-
-   if(type == POSITION_TYPE_BUY)
-   {
-      if(sl > 0.0 && (bid - sl) < minDist) return false;
-      if(tp > 0.0 && (tp - ask) < minDist) return false;
-   }
-   else
-   {
-      if(sl > 0.0 && (sl - ask) < minDist) return false;
-      if(tp > 0.0 && (bid - tp) < minDist) return false;
-   }
-   return true;
 }
 
 // ========================= CONTEXT ENGINE =========================
@@ -427,9 +451,11 @@ string GetBias()
    if(g_candles[0].high > g_candles[1].high && g_candles[1].high > g_candles[2].high &&
       g_candles[0].low  > g_candles[1].low  && g_candles[1].low  > g_candles[2].low)
       return "UP";
+
    if(g_candles[0].high < g_candles[1].high && g_candles[1].high < g_candles[2].high &&
       g_candles[0].low  < g_candles[1].low  && g_candles[1].low  < g_candles[2].low)
       return "DOWN";
+
    return "NEUTRAL";
 }
 
@@ -440,11 +466,13 @@ string GetLiquiditySweepSignal()
    double sweepBuffer = 10.0 * pt;
    double prevHigh = g_candles[1].high;
    double prevLow  = g_candles[1].low;
+
    for(int i = 2; i <= 5; i++)
    {
       prevHigh = MathMax(prevHigh, g_candles[i].high);
       prevLow  = MathMin(prevLow, g_candles[i].low);
    }
+
    if(g_candles[0].low < (prevLow - sweepBuffer) && g_candles[0].close > prevLow) return "BULL";
    if(g_candles[0].high > (prevHigh + sweepBuffer) && g_candles[0].close < prevHigh) return "BEAR";
    return "NONE";
@@ -453,6 +481,7 @@ string GetLiquiditySweepSignal()
 double ComputeContextScore(string signal, string bias, string sweep, string session, double cdi, double trendStrength, double momentumPoints, double avgRangePoints)
 {
    double score = 0.0;
+
    if(signal == "BUY")
    {
       if(bias == "UP") score += 25.0;
@@ -467,23 +496,54 @@ double ComputeContextScore(string signal, string bias, string sweep, string sess
       if(sweep == "BEAR") score += 20.0;
       if(sweep == "BULL") score -= 10.0;
    }
+
    if(MathAbs(trendStrength) > 0.15) score += 10.0;
    if(MathAbs(momentumPoints) > 8.0) score += 10.0;
    if(avgRangePoints > 80.0 && avgRangePoints < 250.0) score += 5.0;
    else if(avgRangePoints > 400.0) score -= 5.0;
+
    if(cdi < 0.35) score += 10.0;
    else if(cdi > MaxCDI) score -= 25.0;
+
    if(session == "Off-hours") score -= 10.0;
    return score;
+}
+
+double ComputeAdaptiveEntryThreshold(string regime, string session, double cdi, double trendStrength, double momentumPoints, double avgRangePoints, double curveFactor)
+{
+   double th = dynamicMinProb;
+
+   if(regime == "low") th += 2.5;
+   else if(regime == "mid") th += 0.0;
+   else if(regime == "high") th -= 2.0;
+
+   if(session == "Off-hours") th += 4.0;
+
+   if(cdi < 0.30) th -= 1.5;
+   else if(cdi > 0.55) th += 3.0;
+
+   if(MathAbs(trendStrength) > 0.18) th -= 2.0;
+   if(MathAbs(momentumPoints) > 10.0) th -= 1.5;
+
+   if(avgRangePoints < 60.0) th += 1.5;
+   else if(avgRangePoints > 160.0 && avgRangePoints < 300.0) th -= 1.0;
+   else if(avgRangePoints > 400.0) th += 2.0;
+
+   if(curveFactor < 0.70) th += 4.0;
+   else if(curveFactor > 1.05) th -= 1.0;
+
+   return ClampDouble(th, 50.0, 80.0);
 }
 
 bool IsSessionAllowed(string session, double adjustedProb, string signal, string bias, string sweep, double trendStrength)
 {
    if(session != "Off-hours") return true;
+
    if(adjustedProb >= dynamicOffHoursMinProb) return true;
    if(signal == "BUY"  && (bias == "UP"   || sweep == "BULL" || trendStrength > 0.15)) return true;
    if(signal == "SELL" && (bias == "DOWN" || sweep == "BEAR" || trendStrength < -0.15)) return true;
    if(AllowOffHours && adjustedProb >= (dynamicMinProb + 5.0) && MathAbs(trendStrength) >= 0.15) return true;
+
    return false;
 }
 
@@ -491,6 +551,7 @@ bool IsSessionAllowed(string session, double adjustedProb, string signal, string
 void UpdateAdaptiveLearning()
 {
    if(fullClosedTrades < 5) return;
+
    double winRate = (double)wins / fullClosedTrades * 100.0;
    double profitFactor = (grossLoss > 0.0) ? grossProfit / grossLoss : 0.0;
    double curveFactor = GetEquityCurveFactor();
@@ -536,10 +597,13 @@ void UpdateAdaptiveLearning()
    dynamicTP1_RR          = ClampDouble(dynamicTP1_RR, 0.80, 1.20);
    dynamicTrailStartRR    = ClampDouble(dynamicTrailStartRR, 1.00, 1.50);
 
-   Log(StringFormat("ADAPTIVE winRate=%.2f PF=%.2f curve=%.2f dynMin=%.2f", winRate, profitFactor, curveFactor, dynamicMinProb));
+   Log(StringFormat("ADAPTIVE winRate=%.2f PF=%.2f curve=%.2f dynMin=%.2f",
+                    winRate, profitFactor, curveFactor, dynamicMinProb));
 }
 
 // ========================= JSON & REQUEST =========================
+
+
 string BuildRequestJSON()
 {
    MqlRates rates[];
@@ -548,48 +612,51 @@ string BuildRequestJSON()
    if(copied < 20)
       copied = MathMax(20, g_candleCount);
 
-   string json = "{\"asset\":\"" + AssetName + "\",\"timeframe\":\"M1\",\"candles\":[";
+   double pt = SymbolPoint();
+   double atr = GetATRValue();
+   double atrPoints = (pt > 0.0) ? atr / pt : 0.0;
+   double avgRangePoints = GetAvgRangePoints();
+   double volFactor = GetVolatilityFactor(atrPoints, avgRangePoints);
+   double curveFactor = GetEquityCurveFactor();
 
+   string json = "{\"asset\":\"" + AssetName + "\",\"timeframe\":\"M1\",\"candles\":[";
    for(int i = 0; i < copied; i++)
    {
       string candle = StringFormat("{\"time\":\"%s\",\"open\":%.5f,\"high\":%.5f,\"low\":%.5f,\"close\":%.5f}",
                                    TimeToString(rates[i].time, TIME_DATE|TIME_MINUTES),
                                    rates[i].open, rates[i].high, rates[i].low, rates[i].close);
       json += candle;
-      if(i < copied - 1)
-         json += ",";
+      if(i < copied - 1) json += ",";
    }
+   json += "],";
 
-   json += "],";   // close candles array
-
-   double spreadPts = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / SymbolPoint();
+   double spreadPts = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / pt;
    double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
    double dd        = (balance > 0.0 && equity < balance) ? ((balance - equity)/balance)*100.0 : 0.0;
 
-   // Correct field list with proper commas
-   json += "\"spread_points\":"      + DoubleToString(spreadPts, 2) + ",";
-   json += "\"bid\":"                + DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_BID), 5) + ",";
-   json += "\"ask\":"                + DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_ASK), 5) + ",";
-   json += "\"confidence_threshold\":" + DoubleToString(MinProbability / 100.0, 4) + ",";
-   json += "\"max_spread_points\":"   + IntegerToString(MaxSpreadPoints) + ",";
-   json += "\"drawdown_pct\":"        + DoubleToString(dd, 2) + ",";
-   json += "\"bars_since_last_trade\":" + IntegerToString(BarsSinceLastEntry()) + ",";
-   json += "\"open_positions\":"      + IntegerToString(CountOurPositions()) + ",";
-   json += "\"max_positions\":"       + IntegerToString(MaxPositions) + ",";
-   
-   // FIXED: Proper key for signal_history
-   json += "\"signal_history\":"      + BuildSignalHistoryJson() + ",";
-   
-   json += "\"session_preference\":\"" + (AllowOffHours ? "Off-hours" : "Active") + "\",";
-   json += "\"account_balance\":"     + DoubleToString(balance, 2) + ",";
-   json += "\"account_equity\":"      + DoubleToString(equity, 2);
+   json += "\"spread_points\":"         + DoubleToString(spreadPts, 2) + ",";
+   json += "\"bid\":"                   + DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_BID), 5) + ",";
+   json += "\"ask\":"                   + DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_ASK), 5) + ",";
+   json += "\"confidence_threshold\":"   + DoubleToString(MinProbability / 100.0, 4) + ",";
+   json += "\"max_spread_points\":"      + IntegerToString(MaxSpreadPoints) + ",";
+   json += "\"drawdown_pct\":"           + DoubleToString(dd, 2) + ",";
+   json += "\"bars_since_last_trade\":"  + DoubleToString(BarsSinceLastEntry()) + ",";
+   json += "\"open_positions\":"         + DoubleToString(CountOurPositions()) + ",";
+   json += "\"max_positions\":"          + DoubleToString(MaxPositions) + ",";
+   json += "\"atr_points\":"             + DoubleToString(atrPoints, 1) + ",";
+   json += "\"volatility_factor\":"      + DoubleToString(volFactor, 3) + ",";
+   json += "\"equity_curve_factor\":"    + DoubleToString(curveFactor, 3) + ",";
+   json += "\"dynamic_min_prob\":"       + DoubleToString(dynamicMinProb, 2) + ",";
+   json += "\"dynamic_risk_factor\":"    + DoubleToString(dynamicRiskFactor, 3) + ",";
+   json += "\"signal_history\":"         + BuildSignalHistoryJson() + ",";
+   json += "\"session_preference\":\""   + (AllowOffHours ? "Off-hours" : "Active") + "\",";
+   json += "\"account_balance\":"        + DoubleToString(balance, 2) + ",";
+   json += "\"account_equity\":"         + DoubleToString(equity, 2);
 
-   json += "}";   // Final closing brace
+   json += "}";
 
-   // Debug - keep for now
-   Print("[DEBUG JSON] Length=", StringLen(json), " | Last 120 chars: ", StringSubstr(json, StringLen(json)-120));
-
+   Print("[DEBUG JSON] Length=", StringLen(json), " | Last 120 chars: ", StringSubstr(json, MathMax(0, StringLen(json)-120)));
    return json;
 }
 
@@ -604,7 +671,7 @@ string Extract(string j, string key)
    if(en == -1) en = StringLen(j);
    string v = StringSubstr(j, st, en - st);
    StringReplace(v, "\"", "");
-   StringTrimLeft(v); 
+   StringTrimLeft(v);
    StringTrimRight(v);
    return v;
 }
@@ -615,20 +682,114 @@ bool SendRequest(string body, string &jsonOut)
    string resp_headers = "";
 
    string headers = "Content-Type: application/json\r\n";
-   if(API_KEY != "") 
+   if(API_KEY != "")
       headers += "X-API-Key: " + API_KEY + "\r\n";
 
-   StringToCharArray(body, post);
+   int len = StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8) - 1;
+   if(len < 0)
+   {
+      jsonOut = "";
+      return false;
+   }
+   ArrayResize(post, len);
 
+   ResetLastError();
    int status = WebRequest("POST", API_URL, headers, HTTPTimeoutMs, post, res, resp_headers);
-   jsonOut = CharArrayToString(res);
+   jsonOut = CharArrayToString(res, 0, -1, CP_UTF8);
 
    if(status != 200)
-      Log(StringFormat("ERROR HTTP=%d | Response: %s", status, jsonOut));
+      Log(StringFormat("ERROR HTTP=%d err=%d | Response: %s", status, GetLastError(), jsonOut));
    else
       Log(StringFormat("SUCCESS HTTP=200 | bytes=%d", ArraySize(res)));
 
    return (status == 200 && StringLen(jsonOut) > 5);
+}
+
+// ========================= DYNAMIC LOT SIZING =========================
+double CalculateDynamicLot(SignalData &d, double entryPrice, double slPrice)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   if(MaxLotCap > 0.0)
+      maxLot = MathMin(maxLot, MaxLotCap);
+
+   if(step <= 0.0) step = 0.01;
+   if(minLot <= 0.0) minLot = step;
+   if(maxLot <= 0.0) maxLot = 100.0;
+
+   double pt = SymbolPoint();
+   double atr = GetATRValue();
+   double atrPoints = (pt > 0.0) ? atr / pt : 0.0;
+   double avgRangePoints = GetAvgRangePoints();
+
+   double volFactor = GetVolatilityFactor(atrPoints, avgRangePoints);
+   double curveFactor = GetEquityCurveFactor();
+
+   double buffer = d.adjusted_probability - d.adaptive_threshold;
+   double confidenceFactor = 1.0;
+
+   if(buffer >= 8.0) confidenceFactor = 1.45;
+   else if(buffer >= 5.0) confidenceFactor = 1.25;
+   else if(buffer >= 2.0) confidenceFactor = 1.10;
+   else if(buffer >= 0.0) confidenceFactor = 1.00;
+   else confidenceFactor = 0.80;
+
+   double riskPct = RiskPercentPerTrade * dynamicRiskFactor * curveFactor * confidenceFactor;
+   riskPct *= (volFactor >= 1.0 ? 1.0 : 0.90);
+   riskPct = ClampDouble(riskPct, 0.20, MaxRiskPercentPerTrade);
+
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * riskPct / 100.0;
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double slDist    = MathAbs(entryPrice - slPrice);
+
+   double lot = 0.0;
+   if(tickValue > 0.0 && tickSize > 0.0 && slDist > 0.0)
+      lot = riskMoney * tickSize / (slDist * tickValue);
+   else
+      lot = BaseLot;
+
+   lot *= volFactor;
+   lot *= d.risk_mult;
+   lot = AdjustRiskByEquity(lot);
+   lot = ClampDouble(lot, 0.0, maxLot);
+
+   // Bonus fallback: force executable minimum only when signal is strong enough
+   if(lot < minLot)
+   {
+      if(buffer >= 5.0)
+      {
+         lot = MathMin(maxLot, minLot * 1.50);
+         Log(StringFormat("Lot boosted by strong signal fallback to %.2f", lot));
+      }
+      else if(buffer >= 2.0)
+      {
+         lot = minLot;
+         Log(StringFormat("Lot adjusted to MIN (%.2f) due to strong signal", lot));
+      }
+      else
+      {
+         return 0.0;
+      }
+   }
+
+   lot = MathFloor(lot / step) * step;
+   lot = NormalizeDouble(lot, 2);
+
+   if(lot < minLot)
+   {
+      if(buffer >= 5.0)
+         lot = minLot;
+      else
+         return 0.0;
+   }
+
+   if(lot > maxLot) lot = maxLot;
+   return lot;
 }
 
 // ========================= SIGNAL ENGINE =========================
@@ -652,13 +813,15 @@ bool GetSignal(SignalData &d)
    double riskMult = StringToDouble(Extract(json, "risk_multiplier"));
    if(riskMult <= 0.0) riskMult = 1.0;
 
-   string session = (StringFind(json, "Off-hours") >= 0) ? "Off-hours" : "Active";
+   // Keep session logic stable and local so it does not depend on nested server JSON shape
+   string session = "Active";
 
    string bias  = GetBias();
    string sweep = GetLiquiditySweepSignal();
    double trendStrength  = GetTrendStrength();
    double momentumPoints = GetMomentumPoints();
    double avgRangePoints = GetAvgRangePoints();
+   double curveFactor    = GetEquityCurveFactor();
 
    string sig = "NONE";
    bool strongContext = (prob >= StrongProb);
@@ -669,12 +832,12 @@ bool GetSignal(SignalData &d)
       if(bias == "UP" || (strongContext && sweep == "BULL") || (mediumContext && trendStrength > -0.10))
          sig = "BUY";
    }
-   if(regime == "high")
+   else if(regime == "high")
    {
       if(bias == "DOWN" || (strongContext && sweep == "BEAR") || (mediumContext && trendStrength < 0.10))
          sig = "SELL";
    }
-   if(regime == "mid" && strongContext)
+   else if(regime == "mid" && strongContext)
    {
       if(bias == "UP") sig = "BUY";
       else if(bias == "DOWN") sig = "SELL";
@@ -686,6 +849,7 @@ bool GetSignal(SignalData &d)
 
    double contextScore = ComputeContextScore(sig, bias, sweep, session, cdi, trendStrength, momentumPoints, avgRangePoints);
    double adjustedProb = ClampDouble(prob + contextScore * 0.10, 0.0, 100.0);
+   double adaptiveThreshold = ComputeAdaptiveEntryThreshold(regime, session, cdi, trendStrength, momentumPoints, avgRangePoints, curveFactor);
 
    d.signal = sig;
    d.probability = prob;
@@ -700,8 +864,10 @@ bool GetSignal(SignalData &d)
    d.momentum_points = momentumPoints;
    d.avg_range_points = avgRangePoints;
    d.context_score = contextScore;
+   d.adaptive_threshold = adaptiveThreshold;
 
-   Log(StringFormat("SIGNAL signal=%s prob=%.2f adj=%.2f regime=%s", sig, prob, adjustedProb, regime));
+   Log(StringFormat("SIGNAL signal=%s prob=%.2f adj=%.2f thr=%.2f regime=%s",
+                    sig, prob, adjustedProb, adaptiveThreshold, regime));
    return true;
 }
 
@@ -711,11 +877,15 @@ bool ModifyPositionByTicket(ulong ticket, double sl, double tp, string why)
    if(!PositionSelectByTicket(ticket)) return false;
    string sym = PositionGetString(POSITION_SYMBOL);
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+
    if(sl > 0.0) sl = NormalizeDouble(sl, digits);
    if(tp > 0.0) tp = NormalizeDouble(tp, digits);
 
-   MqlTradeRequest req; MqlTradeResult result;
-   ZeroMemory(req); ZeroMemory(result);
+   MqlTradeRequest req;
+   MqlTradeResult  result;
+   ZeroMemory(req);
+   ZeroMemory(result);
+
    req.action   = TRADE_ACTION_SLTP;
    req.position = ticket;
    req.symbol   = sym;
@@ -729,6 +899,7 @@ bool ModifyPositionByTicket(ulong ticket, double sl, double tp, string why)
       Log(StringFormat("MODIFY failed ticket=%I64u ret=%d | %s", ticket, result.retcode, why));
       return false;
    }
+
    Log(StringFormat("MODIFY ticket=%I64u SL=%.2f TP=%.2f | %s", ticket, sl, tp, why));
    return true;
 }
@@ -738,6 +909,7 @@ bool ClosePartialByTicket(ulong ticket, double volume)
    if(!PositionSelectByTicket(ticket)) return false;
    double vol = NormalizeVolumeToStep(volume);
    if(vol <= 0.0) return false;
+
    bool ok = trade.PositionClosePartial(ticket, vol);
    if(ok)
       Log(StringFormat("PARTIAL CLOSE ticket=%I64u vol=%.2f", ticket, vol));
@@ -746,9 +918,33 @@ bool ClosePartialByTicket(ulong ticket, double volume)
    return ok;
 }
 
+bool StopDistancesValid(ENUM_POSITION_TYPE type, double sl, double tp)
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double pt  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = (stopsLevel + 2) * pt;
+
+   if(type == POSITION_TYPE_BUY)
+   {
+      if(sl > 0 && (bid - sl) < minDist) return false;
+      if(tp > 0 && (tp - ask) < minDist) return false;
+   }
+   else
+   {
+      if(sl > 0 && (sl - ask) < minDist) return false;
+      if(tp > 0 && (bid - tp) < minDist) return false;
+   }
+
+   return true;
+}
+
 bool OpenPosition(SignalData &d)
 {
    ENUM_POSITION_TYPE ptype = (d.signal == "BUY") ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+
    if(HasOppositePosition(ptype))
    {
       Log("Opposite position open -> skip");
@@ -757,6 +953,7 @@ bool OpenPosition(SignalData &d)
 
    bool sameDirection = HasOpenPositionType(ptype);
    int ourPosCount = CountOurPositions();
+
    if(ourPosCount >= MaxPositions)
    {
       Log("Max positions reached");
@@ -776,45 +973,11 @@ bool OpenPosition(SignalData &d)
    }
 
    double atr = GetATRValue();
-   if(atr <= 0.0) { Log("ATR not ready"); return false; }
-
-   double lot = BaseLot * (d.adjusted_probability / 100.0) * d.risk_mult * dynamicRiskFactor;
-
-   if(sameDirection)
+   if(atr <= 0.0)
    {
-      double requiredProb = MathMax(dynamicScaleInMinProb, dynamicPyramidMinProb);
-      if(d.adjusted_probability < requiredProb)
-      {
-         Log("Pyramid blocked: probability too low");
-         return false;
-      }
-      if(BarsSinceLastEntry() < PyramidCooldownBars)
-      {
-         Log("Pyramid cooldown active");
-         return false;
-      }
-      double curveFactor = GetEquityCurveFactor();
-      if(curveFactor < 0.70)
-      {
-         Log("Pyramid blocked: equity curve weak");
-         return false;
-      }
-      double basketProfit = BasketProfit(ptype);
-      bool basketHealthy = (basketProfit > PyramidMinBasketProfit) || (MathAbs(d.trend_strength) > 0.20) || (d.adjusted_probability >= requiredProb + 3.0);
-      if(!basketHealthy)
-      {
-         Log("Pyramid blocked: basket not healthy");
-         return false;
-      }
-      double pyramidFactor = MathMax(ScaleInLotFactor, PyramidLotFactor);
-      if(curveFactor > 1.05 && basketProfit > 0.0) pyramidFactor = MathMin(1.0, pyramidFactor + 0.10);
-      lot *= pyramidFactor;
-      Log("Pyramiding applied");
+      Log("ATR not ready");
+      return false;
    }
-
-   lot = AdjustRiskByEquity(lot);
-   lot = NormalizeVolumeToStep(lot);
-   if(lot <= 0.0) { Log("Lot size too small"); return false; }
 
    double price = 0.0, sl = 0.0, tp = 0.0;
    if(d.signal == "BUY")
@@ -836,7 +999,93 @@ bool OpenPosition(SignalData &d)
       return false;
    }
 
-   bool ok = (d.signal == "BUY") ? trade.Buy(lot, _Symbol, price, sl, tp) : trade.Sell(lot, _Symbol, price, sl, tp);
+   double lot = CalculateDynamicLot(d, price, sl);
+
+   if(sameDirection)
+   {
+      if(!EnableScaleIn && !EnablePyramiding)
+      {
+         Log("Same-direction entries disabled");
+         return false;
+      }
+
+      double requiredProb = MathMax(dynamicScaleInMinProb, dynamicPyramidMinProb);
+      if(d.adjusted_probability < requiredProb)
+      {
+         Log("Pyramid blocked: probability too low");
+         return false;
+      }
+
+      if(BarsSinceLastEntry() < PyramidCooldownBars)
+      {
+         Log("Pyramid cooldown active");
+         return false;
+      }
+
+      double curveFactor = GetEquityCurveFactor();
+      if(curveFactor < 0.70)
+      {
+         Log("Pyramid blocked: equity curve weak");
+         return false;
+      }
+
+      double basketProfit = BasketProfit(ptype);
+      bool basketHealthy = (basketProfit > PyramidMinBasketProfit) ||
+                           (MathAbs(d.trend_strength) > 0.20) ||
+                           (d.adjusted_probability >= requiredProb + 3.0);
+
+      if(!basketHealthy)
+      {
+         Log("Pyramid blocked: basket not healthy");
+         return false;
+      }
+
+      double pyramidFactor = EnablePyramiding ? PyramidLotFactor : ScaleInLotFactor;
+      if(curveFactor > 1.05 && basketProfit > 0.0)
+         pyramidFactor = MathMin(1.0, pyramidFactor + 0.10);
+
+      if(lot > 0.0) lot *= pyramidFactor;
+      Log("Pyramiding/scale-in applied");
+   }
+
+   lot = NormalizeVolumeToStep(lot);
+
+   // Strong-signal forced minimum fallback so good setups are not blocked by lot sizing.
+   if(lot <= 0.0)
+   {
+      double buffer = d.adjusted_probability - d.adaptive_threshold;
+      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+      if(buffer >= 5.0)
+      {
+         lot = NormalizeVolumeToStep(minLot * 1.50);
+         if(lot <= 0.0) lot = minLot;
+         Log(StringFormat("Lot boosted to strong fallback %.2f", lot));
+      }
+      else if(buffer >= 2.0)
+      {
+         lot = minLot;
+         Log(StringFormat("Lot adjusted to MIN (%.2f) due to strong signal", lot));
+      }
+      else
+      {
+         Log("Lot size too small");
+         return false;
+      }
+   }
+
+   if(lot <= 0.0)
+   {
+      Log("Lot size too small");
+      return false;
+   }
+
+   bool ok = false;
+   if(d.signal == "BUY")
+      ok = trade.Buy(lot, _Symbol, price, sl, tp);
+   else
+      ok = trade.Sell(lot, _Symbol, price, sl, tp);
+
    if(!ok)
    {
       Log(StringFormat("OrderSend failed ret=%d", trade.ResultRetcode()));
@@ -844,7 +1093,8 @@ bool OpenPosition(SignalData &d)
    }
 
    lastEntryCandleTime = lastCandleTime;
-   Log(StringFormat("ENTRY %s lot=%.2f adjProb=%.2f", d.signal, lot, d.adjusted_probability));
+   Log(StringFormat("ENTRY %s lot=%.2f adjProb=%.2f thr=%.2f",
+                    d.signal, lot, d.adjusted_probability, d.adaptive_threshold));
    return true;
 }
 
@@ -888,8 +1138,7 @@ void ManagePositions()
       bool sweepAgainst = (type == POSITION_TYPE_BUY && sweep == "BEAR") || (type == POSITION_TYPE_SELL && sweep == "BULL");
       bool sweepWith    = (type == POSITION_TYPE_BUY && sweep == "BULL") || (type == POSITION_TYPE_SELL && sweep == "BEAR");
 
-      // Partial TP1
-      if(rr >= dynamicTP1_RR && !IsPartialClosed(ticket))
+      if(rr >= 1.0 && !IsPartialClosed(ticket))
       {
          double partialVol = NormalizeVolumeToStep(vol / 2.0);
          if(partialVol > 0.0 && partialVol < vol)
@@ -902,20 +1151,22 @@ void ManagePositions()
       bool wantModify = false;
       string why = "";
 
-      // Break-even
       if(rr >= 1.0)
       {
-         if(type == POSITION_TYPE_BUY && open > desiredSL)
+         if(type == POSITION_TYPE_BUY && (desiredSL == 0.0 || open > desiredSL))
          {
-            desiredSL = open; wantModify = true; why += "BE ";
+            desiredSL = open;
+            wantModify = true;
+            why += "BE ";
          }
          else if(type == POSITION_TYPE_SELL && (desiredSL == 0.0 || open < desiredSL))
          {
-            desiredSL = open; wantModify = true; why += "BE ";
+            desiredSL = open;
+            wantModify = true;
+            why += "BE ";
          }
       }
 
-      // Trailing & TP extension
       if(rr >= dynamicTrailStartRR)
       {
          double trailATR = biasMatches ? dynamicTrailATRStrong : dynamicTrailATRWeak;
@@ -926,30 +1177,40 @@ void ManagePositions()
             double trailSL = bid - atr * trailATR;
             if(trailSL > desiredSL)
             {
-               desiredSL = trailSL; wantModify = true; why += (biasMatches ? "TRAIL_STRONG " : "TRAIL_WEAK ");
+               desiredSL = trailSL;
+               wantModify = true;
+               why += (biasMatches ? "TRAIL_STRONG " : "TRAIL_WEAK ");
             }
-            if(biasMatches || sweepWith)
+
+            if(biasMatches || sweepWith || momentumAbs > 10.0)
             {
                double extTP = bid + atr * dynamicTP2ExtendATR * tpCurveMult;
                if(extTP > desiredTP)
                {
-                  desiredTP = extTP; wantModify = true; why += "EXTEND_TP ";
+                  desiredTP = extTP;
+                  wantModify = true;
+                  why += "EXTEND_TP ";
                }
             }
          }
-         else // SELL
+         else
          {
             double trailSL = ask + atr * trailATR;
             if(desiredSL == 0.0 || trailSL < desiredSL)
             {
-               desiredSL = trailSL; wantModify = true; why += (biasMatches ? "TRAIL_STRONG " : "TRAIL_WEAK ");
+               desiredSL = trailSL;
+               wantModify = true;
+               why += (biasMatches ? "TRAIL_STRONG " : "TRAIL_WEAK ");
             }
-            if(biasMatches || sweepWith)
+
+            if(biasMatches || sweepWith || momentumAbs > 10.0)
             {
                double extTP = ask - atr * dynamicTP2ExtendATR * tpCurveMult;
                if(desiredTP == 0.0 || extTP < desiredTP)
                {
-                  desiredTP = extTP; wantModify = true; why += "EXTEND_TP ";
+                  desiredTP = extTP;
+                  wantModify = true;
+                  why += "EXTEND_TP ";
                }
             }
          }
@@ -960,6 +1221,7 @@ void ManagePositions()
          double minMove = MinModifyPoints * pt;
          bool slChanged = (desiredSL > 0.0 && MathAbs(desiredSL - sl) >= minMove);
          bool tpChanged = (desiredTP > 0.0 && MathAbs(desiredTP - tp) >= minMove);
+
          if(slChanged || tpChanged)
             if(StopDistancesValid(type, desiredSL, desiredTP))
                ModifyPositionByTicket(ticket, desiredSL, desiredTP, why);
@@ -978,16 +1240,11 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    if(sym != _Symbol || magic != MagicNumber) return;
 
    long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
-   long reason = HistoryDealGetInteger(trans.deal, DEAL_REASON);
    double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
    ulong positionId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
    bool positionStillOpen = PositionSelectByTicket(positionId);
 
-   if(entry == DEAL_ENTRY_IN)
-   {
-      // open log
-   }
-   else if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY || entry == DEAL_ENTRY_INOUT)
+   if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY || entry == DEAL_ENTRY_INOUT)
    {
       totalClosedEvents++;
       netProfit += profit;
@@ -1000,6 +1257,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
       {
          fullClosedTrades++;
          fullNetProfit += profit;
+
          if(profit >= 0.0)
          {
             wins++;
@@ -1014,6 +1272,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
             consecutiveLosses++;
             consecutiveWins = 0;
          }
+
          UpdateEquityHistory();
          UpdateAdaptiveLearning();
       }
@@ -1039,33 +1298,45 @@ void OnTimer()
    if(!GetSignal(d))
    {
       PushRecentSignal("NONE");
+      confirmSignalName = "";
+      confirmSignalCount = 0;
       return;
    }
 
    PushRecentSignal(d.signal);
 
-   if(d.signal == "NONE") return;
-
-   if(d.adjusted_probability < dynamicMinProb || d.cdi > MaxCDI ||
-      !IsSessionAllowed(d.session, d.adjusted_probability, d.signal, d.bias, d.sweep, d.trend_strength))
-      return;
-
-   if(signalCount < SignalConfirmations)
+   if(d.signal == "NONE")
    {
-      signalBuffer[signalCount % SignalConfirmations] = d.signal;
-      signalCount++;
+      confirmSignalName = "";
+      confirmSignalCount = 0;
       return;
    }
 
-   signalBuffer[signalCount % SignalConfirmations] = d.signal;
-   signalCount++;
+   if(d.adjusted_probability < d.adaptive_threshold || d.cdi > MaxCDI ||
+      !IsSessionAllowed(d.session, d.adjusted_probability, d.signal, d.bias, d.sweep, d.trend_strength))
+   {
+      confirmSignalName = "";
+      confirmSignalCount = 0;
+      return;
+   }
 
-   bool confirmed = true;
-   for(int i = 1; i < SignalConfirmations; i++)
-      if(signalBuffer[i] != signalBuffer[0]) { confirmed = false; break; }
+   if(confirmSignalName != d.signal)
+   {
+      confirmSignalName = d.signal;
+      confirmSignalCount = 1;
+      return;
+   }
 
-   if(confirmed)
-      OpenPosition(d);
+   confirmSignalCount++;
+
+   if(confirmSignalCount < SignalConfirmations)
+      return;
+
+   if(OpenPosition(d))
+   {
+      confirmSignalName = "";
+      confirmSignalCount = 0;
+   }
 
    if(UsePanel) UpdatePanel(d.regime, d.adjusted_probability, false);
 }
