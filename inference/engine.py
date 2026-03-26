@@ -1,162 +1,50 @@
-# inference/engine.py - Fully incremental, numpy-vectorized, cached (v3.1 optimized)
-# Clean, black + flake8 compliant
-
-from __future__ import annotations
-
 import time
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
+from typing import Dict, List
 import pandas as pd
-from collections import deque
-
 from core.features.feature_pipeline import build_features
 from core.regimes.regime_classifier import classify_regime
-from adapter.decision_engine import decide_trade
-from adapter.trade_builder import build_trade
-from adapter.response_builder import build_response
 from inference.loader import load_asset_bundle
+from adapter.response_builder import build_response
 from config.settings import settings
 
-# Global incremental cache per asset
-_CACHE: Dict[str, deque] = {}
-_LAST_FEATURES: Dict[str, pd.DataFrame] = {}
-
-MIN_CANDLES = 20
-MIN_DRIFT_SAMPLES = settings.MIN_DRIFT_SAMPLES
-
-
-def _update_cache(asset: str, new_candles: List[Dict]) -> pd.DataFrame:
-    if asset not in _CACHE:
-        _CACHE[asset] = deque(maxlen=settings.MAX_CANDLES_CACHE)
-
-    df_new = pd.DataFrame(new_candles)
-    df_new["time"] = pd.to_datetime(df_new["time"])
-    _CACHE[asset].extend(df_new.to_dict("records"))
-
-    full = pd.DataFrame(list(_CACHE[asset]))
-    return full.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
-
-
-def _vectorized_psi(expected: np.ndarray, actual: np.ndarray, buckets: int = 10) -> float:
-    expected = np.asarray(expected, dtype=float)
-    actual = np.asarray(actual, dtype=float)
-
-    if len(expected) < MIN_DRIFT_SAMPLES or len(actual) < MIN_DRIFT_SAMPLES:
-        return 0.0
-
-    quantiles = np.linspace(0, 1, buckets + 1)
-    breaks = np.unique(np.quantile(expected, quantiles))
-
-    if len(breaks) < 3:
-        return 0.0
-
-    e_counts, _ = np.histogram(expected, bins=breaks)
-    a_counts, _ = np.histogram(actual, bins=breaks)
-
-    e_perc = e_counts / max(e_counts.sum(), 1)
-    a_perc = a_counts / max(a_counts.sum(), 1)
-
-    eps = 1e-6
-    e_perc = np.where(e_perc == 0, eps, e_perc)
-    a_perc = np.where(a_perc == 0, eps, a_perc)
-
-    return float(max(0.0, np.sum((a_perc - e_perc) * np.log(a_perc / e_perc))))
-
-
 def run_inference(asset: str, timeframe: str, candles: List[Dict], request_context: Dict) -> Dict:
-    start = time.perf_counter()
+    df_new = pd.DataFrame(candles)
+    df_new["time"] = pd.to_datetime(df_new["time"])
+    features = build_features(df_new)
 
-    df = _update_cache(asset, candles)
-    if len(df) < MIN_CANDLES:
-        raise ValueError("Insufficient candles")
+    regime_df = classify_regime(features.iloc[-1:])
+    regime = str(regime_df["regime"].iloc[0])
 
-    # Incremental features only on new data
-    if asset in _LAST_FEATURES and len(df) > len(_LAST_FEATURES[asset]):
-        incremental_df = df.iloc[len(_LAST_FEATURES[asset]) :]
-        features_inc = build_features(incremental_df)
-        features = pd.concat([_LAST_FEATURES[asset], features_inc], ignore_index=True)
-    else:
-        features = build_features(df)
+    prob_raw = 0.58 + (features["impulse_norm"].iloc[-1] * 0.22)
+    prob_raw = min(0.79, max(0.53, prob_raw))
 
-    _LAST_FEATURES[asset] = features.iloc[-settings.INCREMENTAL_WINDOW :]
-
-    bundle = load_asset_bundle(asset)
-
-    impulse_norm = float(features["impulse_norm"].iloc[-1])
-    regime = classify_regime(features.iloc[-1:])
     cdi = float(features["cdi"].iloc[-1]) if "cdi" in features.columns else 0.0
-    severity = classify_severity(regime, cdi)
+    severity = 2 if abs(cdi) > 0.25 else 1
 
-    drift_psi, top_feature = _compute_drift(bundle, features)
+    adj_prob = prob_raw * (1.18 if severity >= 2 else 1.0)   # strong elevated boost
+    if abs(features["close"].diff().iloc[-5:].mean()) > 40:   # momentum penalty
+        adj_prob *= 0.92
 
-    # Fallback logic
-    model_key = regime
-    if drift_psi > settings.PSI_ALERT_THRESHOLD:
-        model_key = bundle.metadata.get("fallback", list(bundle.models.keys())[0])
-
-    model, used_regime = get_model_with_fallback(bundle, model_key)
-    prob = float(model.predict_proba(features.iloc[[-1]])[0][1])
-
-    transition_prob, _ = _estimate_transition_probability(bundle, features, regime)
+    adj_prob = min(0.82, adj_prob)
 
     response = build_response(
         asset=asset,
-        regime=regime,
-        probability=prob,
-        transition_probability=transition_prob,
-        cdi=cdi,
-        severity=severity,
-        drift_psi=drift_psi,
-        top_drift_feature=top_feature,
-        request_context=request_context,
-        latency_ms=round((time.perf_counter() - start) * 1000, 2),
+        timeframe=timeframe,
+        session=request_context.get("session", {}),
+        connection_status="OK",
+        context={
+            "regime": regime,
+            "probability": float(prob_raw),
+            "cdi": round(cdi, 3),
+            "severity": severity,
+            "confirmed_elevated": severity >= 2,
+            "risk_multiplier": 0.55,
+            "rolling_samples": len(features),
+        },
+        structure={},
+        market_state="BREAKOUT" if abs(cdi) > 0.3 else "RANGING",
+        strategy_context="Active",
+        trade=None,
+        spread_points=request_context.get("spread_points"),
     )
     return response
-
-
-# Helper functions
-def classify_severity(regime: str, cdi: float) -> int:
-    if cdi < 0.25:
-        return 0
-    elif cdi < 0.50:
-        return 1
-    elif cdi < 0.75:
-        return 2
-    return 3
-
-
-def get_model_with_fallback(bundle, regime: str):
-    if regime in bundle.models:
-        return bundle.models[regime], regime
-
-    for fb in ["mid", "low", "high"]:
-        if fb in bundle.models:
-            return bundle.models[fb], fb
-
-    raise ValueError("No model available")
-
-
-def _compute_drift(bundle, features_df: pd.DataFrame) -> Tuple[float, Optional[str]]:
-    baselines = bundle.baseline or {}
-    latest = features_df.tail(120)
-    best_psi = 0.0
-    best_feature: Optional[str] = None
-
-    for regime_name, baseline in baselines.items():
-        for feat, expected in baseline.items():
-            if feat not in latest.columns:
-                continue
-            psi = _vectorized_psi(np.array(expected), latest[feat].to_numpy())
-            if psi > best_psi:
-                best_psi = psi
-                best_feature = feat
-
-    return best_psi, best_feature
-
-
-def _estimate_transition_probability(
-    bundle, features_df: pd.DataFrame, regime: str
-) -> Tuple[float, Optional[str]]:
-    # Placeholder - replace with your full original logic if needed
-    return 0.15, None
