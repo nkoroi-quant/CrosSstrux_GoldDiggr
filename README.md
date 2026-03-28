@@ -1,4 +1,4 @@
-# CrosSstrux GoldDiggr v3.1
+# CrosSstrux GoldDiggr v3.2
 
 Production-grade XAUUSD regime detection + structure trading engine with FastAPI backend and MT5 GoldDiggr EA.
 
@@ -6,15 +6,15 @@ Production-grade XAUUSD regime detection + structure trading engine with FastAPI
 
 ```mermaid
 flowchart TD
-    A[MT5 Terminal] --> B[GoldDiggr.mq5 EA]
-    B --> C[POST /analyze]
+    A[MT5 Terminal] --> B[GoldDiggr.mq5 EA v11.5]
+    B --> C[POST /analyze<br>Rate-limited + Cached]
     D[Collector] --> E[Parquet M1]
     F[Training Pipeline] --> G[Model Registry + Drift Baseline]
     E --> F
-    G --> H[Inference Engine\nIncremental + Numpy]
+    G --> H[Inference Engine Incremental + Numpy]
     H --> C
     C --> B
-    I[FastAPI Server] --> J[Rate-Limited + API-Key + Sentry]
+    I[FastAPI Server v3.2] --> J[Rate-Limited + API-Key + Sentry + LRU Cache]
     subgraph Dashboard
         K[Drift Monitor Streamlit]
     end

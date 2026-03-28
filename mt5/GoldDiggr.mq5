@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "nkoroi-quant + integration"
 #property link      "https://github.com/nkoroi-quant/CrosSstrux_GoldDiggr"
-#property version   "11.3"
+#property version   "12.0"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -64,6 +64,10 @@ input double EquitySoftDDLimit      = 0.05;
 input double EquityHardDDLimit      = 0.10;
 
 input bool   UsePanel               = true;
+
+// NEW efficiency inputs from v11.5
+input bool   UseRichResponse        = false;      // default false for bandwidth
+input int    RequestThrottleSeconds = 5;          // prevent request spam
 
 // ========================= CONSTANTS =========================
 #define CONTEXT_WINDOW 30
@@ -137,6 +141,7 @@ datetime g_lastHealthProbe = 0;
 bool g_lastHealthOk = false;
 int g_consecutiveHttpFails = 0;
 datetime g_lastDecisionTraceBar = 0;
+datetime g_lastRequestTime = 0;
 
 SignalData g_cachedSignal;
 bool g_contextReady = false;
@@ -151,6 +156,8 @@ ulong partialClosedTickets[128];
 
 int atrHandle = INVALID_HANDLE;
 string PanelPrefix = "GoldDiggr_";
+long   panelChartID = 0;
+bool   panelCreated = false;
 
 // Equity tracking
 double equityHistory[EQUITY_HISTORY_SIZE];
@@ -215,6 +222,20 @@ void LogM1Heartbeat()
       cachedSignal, ctxSource, cachedConf, cachedProb, cachedRegime, cachedState, cachedH1, cachedM15, cachedM5,
       buyPrec, sellPrec, ctxAgeMins
    ));
+}
+
+
+// ========================= NEW: IsNewBar (v11.5 upgrade) =========================
+bool IsNewBar()
+{
+   static datetime lastBar = 0;
+   datetime currentBar = iTime(_Symbol, PERIOD_M1, 0);
+   if(currentBar != lastBar)
+   {
+      lastBar = currentBar;
+      return true;
+   }
+   return false;
 }
 
 string ResolveHealthUrl()
@@ -759,6 +780,7 @@ string BuildRequestJSON()
    json += "\"equity_curve_factor\":" + DoubleToString(curveFactor, 3) + ",";
    json += "\"cdi\":" + DoubleToString(cdi, 3) + ",";
    json += "\"signal_history\":" + BuildSignalHistoryJson() + ",";
+   json += "\"include_rich\":" + (UseRichResponse ? "true" : "false") + ",";
    json += "\"session_preference\":\"" + (AllowOffHours ? "Off-hours" : "Active") + "\",";
    json += "\"account_balance\":" + DoubleToString(balance, 2) + ",";
    json += "\"account_equity\":" + DoubleToString(equity, 2);
@@ -806,7 +828,7 @@ double ExtractDoubleField(string json, string key, double defaultValue = 0.0)
    return d;
 }
 
-bool SendRequest(string body, string &jsonOut)
+bool SendRequest(string body, string &jsonOut, string urlOverride = "")
 {
    char post[], res[];
    string resp_headers = "";
@@ -822,11 +844,13 @@ bool SendRequest(string body, string &jsonOut)
    }
    ArrayResize(post, len);
 
+   string targetUrl = (urlOverride == "" ? API_URL : urlOverride);
+
    if(EnableHttpDiagnostics)
-      Log(StringFormat("POST url=%s bytes=%d", API_URL, len));
+      Log(StringFormat("POST url=%s bytes=%d", targetUrl, len));
 
    ResetLastError();
-   int status = WebRequest("POST", API_URL, headers, HTTPTimeoutMs, post, res, resp_headers);
+   int status = WebRequest("POST", targetUrl, headers, HTTPTimeoutMs, post, res, resp_headers);
    jsonOut = CharArrayToString(res, 0, -1, CP_UTF8);
 
    if(status != 200)
@@ -844,12 +868,57 @@ bool SendRequest(string body, string &jsonOut)
    return (StringLen(jsonOut) > 5);
 }
 
-bool SendRequestWithRetry(string body, string &jsonOut)
+bool WebRequestWithRetry(string method, string url, string body, string &result[])
 {
-   if(SendRequest(body, jsonOut))
-      return true;
-   Sleep(150);
-   return SendRequest(body, jsonOut);
+   for(int attempt = 0; attempt < 3; attempt++)
+   {
+      char post[], res[];
+      string resp_headers = "";
+      string headers = "Content-Type: application/json
+";
+      if(API_KEY != "")
+         headers += "X-API-Key: " + API_KEY + "
+";
+
+      int len = StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8) - 1;
+      if(len < 0)
+         return -1;
+      ArrayResize(post, len);
+
+      ResetLastError();
+      int status = WebRequest(method, url, headers, HTTPTimeoutMs, post, res, resp_headers);
+      ArrayResize(result, 0);
+      if(status == 200)
+      {
+         string full = CharArrayToString(res, 0, -1, CP_UTF8);
+         int pieces = StringLen(full) > 0 ? 1 : 0;
+         if(pieces > 0)
+         {
+            ArrayResize(result, 1);
+            result[0] = full;
+         }
+         g_consecutiveHttpFails = 0;
+         return 200;
+      }
+
+      Sleep(300 * (attempt + 1));
+   }
+
+   g_consecutiveHttpFails++;
+   Log("WebRequestWithRetry failed after 3 attempts. Consecutive fails: " + IntegerToString(g_consecutiveHttpFails));
+   return -1;
+}
+
+bool SendRequestWithRetry(string body, string &jsonOut, string urlOverride = "")
+{
+   string targetUrl = (urlOverride == "" ? API_URL : urlOverride);
+   string result[];
+   int status = WebRequestWithRetry("POST", targetUrl, body, result);
+   if(status != 200 || ArraySize(result) <= 0)
+      return false;
+
+   jsonOut = result[0];
+   return (StringLen(jsonOut) > 5);
 }
 
 // ========================= LOT SIZING =========================
@@ -1042,8 +1111,11 @@ bool UpdateContextCache()
    if(g_m1Count < 10 || g_m5Count < 10 || g_m15Count < 10 || g_h1Count < 10) return false;
    if(g_m15BarTime == 0 || g_m1BarTime == 0) return false;
 
-   // Refresh only once for each newly closed M1 bar.
+   // v11.5: refresh once per closed M1 bar, and throttle repeated server calls.
    if(g_lastContextAttemptBar == g_m1BarTime)
+      return g_contextReady;
+
+   if(g_lastRequestTime > 0 && (TimeCurrent() - g_lastRequestTime) < RequestThrottleSeconds)
       return g_contextReady;
 
    int ctxAgeMins = (g_lastContextRefreshTime > 0) ? (int)((TimeCurrent() - g_lastContextRefreshTime) / 60) : 9999;
@@ -1059,13 +1131,19 @@ bool UpdateContextCache()
 
    g_lastContextAttemptBar = g_m1BarTime;
    g_lastContextAttemptTime = TimeCurrent();
+   g_lastRequestTime = TimeCurrent();
 
    if(EnableHttpDiagnostics)
       ProbeServerHealth(false);
 
    string body = BuildRequestJSON();
    string json = "";
-   bool requestOk = SendRequestWithRetry(body, json);
+   string targetUrl = API_URL + (UseRichResponse ? "?include_rich=true" : "?include_rich=false");
+   string result[];
+   int requestStatus = WebRequestWithRetry("POST", targetUrl, body, result);
+   bool requestOk = (requestStatus == 200 && ArraySize(result) > 0);
+   if(requestOk)
+      json = result[0];
    if(!requestOk)
    {
       Log("Context server call failed -> using local fallback context");
@@ -1087,6 +1165,7 @@ bool UpdateContextCache()
       g_lastContextRefreshBar = g_m1BarTime;
       g_lastContextM15Bar = g_lastContextRefreshBar;
       g_lastContextResponse = "";
+      if(UsePanel) UpdatePanel(local.regime, local.probability, false);
       Log(StringFormat("CTX signal=%s conf=%.2f prob=%.2f regime=%s state=%s h1=%s m15=%s m5=%s m1=%.2f src=LOCAL",
                        local.signal, local.signal_confidence, local.probability, local.regime,
                        local.market_state, local.h1_bias, local.m15_bias, local.m5_bias, local.m1_precision_score));
@@ -1171,6 +1250,7 @@ bool UpdateContextCache()
    g_lastContextRefreshTime = TimeCurrent();
    g_lastContextRefreshBar = g_m1BarTime;
    g_lastContextM15Bar = g_lastContextRefreshBar;
+   if(UsePanel) UpdatePanel(d.regime, d.probability, false);
 
    Log(StringFormat("CTX signal=%s conf=%.2f prob=%.2f regime=%s state=%s h1=%s m15=%s m5=%s m1=%.2f src=SERVER ageMins=0",
                     d.signal, d.signal_confidence, d.probability, d.regime,
@@ -1585,8 +1665,98 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 }
 
 // ========================= PANEL =========================
-void CreatePanel() { Log("Panel enabled (basic)"); }
-void UpdatePanel(string regime, double prob, bool elevated) { /* optional */ }
+double GetEquityDrawdownPct()
+{
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq <= 0.0 || equityPeak <= 0.0) return 0.0;
+   if(eq > equityPeak) equityPeak = eq;
+   return ClampDouble(((equityPeak - eq) / equityPeak) * 100.0, 0.0, 100.0);
+}
+
+double CalculateWinRate()
+{
+   int closed = wins + losses;
+   if(closed <= 0) return 0.0;
+   return 100.0 * (double)wins / (double)closed;
+}
+
+void CreatePanel()
+{
+   if(!UsePanel || panelCreated) return;
+
+   panelChartID = ChartID();
+
+   ObjectCreate(panelChartID, PanelPrefix+"BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(panelChartID, PanelPrefix+"BG", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(panelChartID, PanelPrefix+"BG", OBJPROP_YDISTANCE, 10);
+   ObjectSetInteger(panelChartID, PanelPrefix+"BG", OBJPROP_XSIZE, 320);
+   ObjectSetInteger(panelChartID, PanelPrefix+"BG", OBJPROP_YSIZE, 220);
+   ObjectSetInteger(panelChartID, PanelPrefix+"BG", OBJPROP_BGCOLOR, clrBlack);
+   ObjectSetInteger(panelChartID, PanelPrefix+"BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(panelChartID, PanelPrefix+"BG", OBJPROP_COLOR, clrWhite);
+
+   ObjectCreate(panelChartID, PanelPrefix+"Title", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Title", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Title", OBJPROP_YDISTANCE, 20);
+   ObjectSetString(panelChartID, PanelPrefix+"Title", OBJPROP_TEXT, "GoldDiggr v12.0");
+   ObjectSetInteger(panelChartID, PanelPrefix+"Title", OBJPROP_COLOR, clrGold);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Title", OBJPROP_FONTSIZE, 12);
+
+   ObjectCreate(panelChartID, PanelPrefix+"Conn", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Conn", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Conn", OBJPROP_YDISTANCE, 45);
+
+   ObjectCreate(panelChartID, PanelPrefix+"Regime", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Regime", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Regime", OBJPROP_YDISTANCE, 70);
+
+   ObjectCreate(panelChartID, PanelPrefix+"Prob", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Prob", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Prob", OBJPROP_YDISTANCE, 95);
+
+   ObjectCreate(panelChartID, PanelPrefix+"Signal", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Signal", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Signal", OBJPROP_YDISTANCE, 120);
+
+   ObjectCreate(panelChartID, PanelPrefix+"DD", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(panelChartID, PanelPrefix+"DD", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(panelChartID, PanelPrefix+"DD", OBJPROP_YDISTANCE, 145);
+
+   ObjectCreate(panelChartID, PanelPrefix+"Winrate", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Winrate", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Winrate", OBJPROP_YDISTANCE, 170);
+
+   panelCreated = true;
+   Log("Panel created with live objects");
+}
+
+void UpdatePanel(string regime, double prob)
+{
+   UpdatePanel(regime, prob, false);
+}
+
+void UpdatePanel(string regime, double prob, bool elevated)
+{
+   if(!panelCreated) CreatePanel();
+   if(!UsePanel) return;
+
+   string connText = (g_contextReady && g_consecutiveHttpFails == 0) ? "CONNECTED ✓" : "OFFLINE (" + IntegerToString(g_consecutiveHttpFails) + ")";
+   if(elevated) connText = connText + " / ALERT";
+   color connColor = (g_contextReady && g_consecutiveHttpFails == 0) ? clrLime : clrRed;
+
+   ObjectSetString(panelChartID, PanelPrefix+"Conn", OBJPROP_TEXT, "Status: " + connText);
+   ObjectSetInteger(panelChartID, PanelPrefix+"Conn", OBJPROP_COLOR, connColor);
+
+   if(g_contextReady)
+   {
+      ObjectSetString(panelChartID, PanelPrefix+"Regime", OBJPROP_TEXT, "Regime: " + regime);
+      ObjectSetString(panelChartID, PanelPrefix+"Prob", OBJPROP_TEXT, "Probability: " + DoubleToString(prob, 1) + "%");
+      ObjectSetString(panelChartID, PanelPrefix+"Signal", OBJPROP_TEXT, "Signal: " + g_cachedSignal.signal);
+      ObjectSetString(panelChartID, PanelPrefix+"DD", OBJPROP_TEXT, "Equity DD: " + DoubleToString(GetEquityDrawdownPct(), 2) + "%");
+      ObjectSetString(panelChartID, PanelPrefix+"Winrate", OBJPROP_TEXT, "Winrate: " + DoubleToString(CalculateWinRate(), 1) + "%");
+   }
+   ChartRedraw(panelChartID);
+}
 
 // ========================= PANEL / CLEANUP HELPERS =========================
 
@@ -1639,7 +1809,7 @@ int OnInit()
    EventSetTimer(1);
    if(UsePanel) CreatePanel();
 
-   Log("GoldDiggr MTF optimized initialized successfully");
+   Log("GoldDiggr MTF optimized v12.0 initialized successfully");
    return INIT_SUCCEEDED;
 }
 
@@ -1648,10 +1818,11 @@ void OnDeinit(const int reason)
    EventKillTimer();
    if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
    if(UsePanel) DeleteObjectsByPrefix(PanelPrefix);
+   panelCreated = false;
 }
 
-// ========================= TIMER =========================
-void OnTimer()
+// ========================= TRADING CYCLE =========================
+void ProcessTradingCycle()
 {
    if(!RefreshBuffers()) return;
 
@@ -1668,12 +1839,16 @@ void OnTimer()
    }
 
    if(!UpdateContextCache())
+   {
+      if(UsePanel) UpdatePanel(g_contextReady ? g_cachedSignal.regime : "N/A", g_contextReady ? g_cachedSignal.probability : 0.0, false);
       return;
+   }
 
    SignalData d = g_cachedSignal;
    int liveCtxAgeMins = (g_contextReady && g_lastContextRefreshTime > 0) ? (int)((TimeCurrent() - g_lastContextRefreshTime) / 60) : 9999;
    if(g_contextReady && liveCtxAgeMins > ContextMaxAgeMins)
       Log(StringFormat("Context age %d mins exceeds limit %d -> refreshing on next M1 close", liveCtxAgeMins, ContextMaxAgeMins));
+
    if(!d.valid || (d.signal != "BUY" && d.signal != "SELL"))
    {
       if(g_lastDecisionTraceBar != g_m1BarTime)
@@ -1792,6 +1967,23 @@ void OnTimer()
       g_confirmSignalName = "";
       g_confirmSignalCount = 0;
    }
+}
 
-   if(UsePanel) UpdatePanel(d.regime, d.signal_confidence, false);
+void OnTick()
+{
+   if(!IsNewBar())
+      return;
+
+   ProcessTradingCycle();
+}
+
+// ========================= TIMER =========================
+void OnTimer()
+{
+   if(!UsePanel) return;
+
+   if(g_contextReady)
+      UpdatePanel(g_cachedSignal.regime, g_cachedSignal.probability, false);
+   else
+      UpdatePanel("N/A", 0.0, false);
 }
